@@ -1,0 +1,164 @@
+import cv2
+import numpy as np
+import os
+import glob
+
+def procesar_resistencia(imagen_path):
+    """
+    Procesa una imagen de resistencia y devuelve la vista superior del rectángulo azul.
+    
+    Args:
+        imagen_path (str): Ruta de la imagen de entrada
+    
+    Returns:
+        numpy.ndarray: Imagen transformada a vista superior, o None si hay error
+    """
+    img = cv2.imread(imagen_path)
+    if img is None:
+        print(f"Error: No se pudo cargar {imagen_path}")
+        return None
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Suavizado gaussiano
+    img_suavizada = cv2.GaussianBlur(img_rgb, (5, 5), 1.0)
+    
+    # Segmentación por color HSV para detectar azul
+    img_hsv = cv2.cvtColor(img_suavizada, cv2.COLOR_RGB2HSV)
+    azul_bajo = np.array([100, 50, 50])
+    azul_alto = np.array([130, 255, 255])
+    mascara_azul = cv2.inRange(img_hsv, azul_bajo, azul_alto)
+    
+    # Operaciones morfológicas para limpiar
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mascara_limpia = cv2.morphologyEx(mascara_azul, cv2.MORPH_OPEN, kernel)
+    mascara_limpia = cv2.morphologyEx(mascara_limpia, cv2.MORPH_CLOSE, kernel)
+    
+    kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+    mascara_limpia = cv2.morphologyEx(mascara_limpia, cv2.MORPH_CLOSE, kernel_vertical)
+    
+    # Encontrar contornos
+    contornos, _ = cv2.findContours(mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if len(contornos) == 0:
+        print(f"Error: No se encontraron contornos en {imagen_path}")
+        return None
+    
+    contorno_principal = max(contornos, key=cv2.contourArea)
+    
+    # Aproximación poligonal para obtener 4 esquinas
+    epsilon = 0.02 * cv2.arcLength(contorno_principal, True)
+    aproximacion = cv2.approxPolyDP(contorno_principal, epsilon, True)
+    
+    if len(aproximacion) != 4:
+        rect = cv2.minAreaRect(contorno_principal)
+        puntos_rect = cv2.boxPoints(rect)
+        aproximacion = np.int32(puntos_rect).reshape(-1, 1, 2)
+    
+    # Ordenar los 4 puntos del rectángulo
+    puntos = aproximacion.reshape(4, 2).astype(np.float32)
+    puntos_ordenados = np.zeros((4, 2), dtype=np.float32)
+    
+    suma = puntos.sum(axis=1)
+    diferencia = np.diff(puntos, axis=1)
+    
+    puntos_ordenados[0] = puntos[np.argmin(suma)]
+    puntos_ordenados[2] = puntos[np.argmax(suma)]
+    puntos_ordenados[1] = puntos[np.argmin(diferencia)]
+    puntos_ordenados[3] = puntos[np.argmax(diferencia)]
+    
+    # Calcular dimensiones del rectángulo de salida
+    ancho_a = np.sqrt(((puntos_ordenados[2][0] - puntos_ordenados[3][0]) ** 2) +
+                      ((puntos_ordenados[2][1] - puntos_ordenados[3][1]) ** 2))
+    ancho_b = np.sqrt(((puntos_ordenados[1][0] - puntos_ordenados[0][0]) ** 2) +
+                      ((puntos_ordenados[1][1] - puntos_ordenados[0][1]) ** 2))
+    ancho_max = max(int(ancho_a), int(ancho_b))
+    
+    alto_a = np.sqrt(((puntos_ordenados[1][0] - puntos_ordenados[2][0]) ** 2) +
+                     ((puntos_ordenados[1][1] - puntos_ordenados[2][1]) ** 2))
+    alto_b = np.sqrt(((puntos_ordenados[0][0] - puntos_ordenados[3][0]) ** 2) +
+                     ((puntos_ordenados[0][1] - puntos_ordenados[3][1]) ** 2))
+    alto_max = max(int(alto_a), int(alto_b))
+    
+    # Transformación de perspectiva
+    puntos_destino = np.array([
+        [0, 0],
+        [ancho_max - 1, 0],
+        [ancho_max - 1, alto_max - 1],
+        [0, alto_max - 1]
+    ], dtype=np.float32)
+    
+    matriz_transformacion = cv2.getPerspectiveTransform(puntos_ordenados, puntos_destino)
+    img_transformada = cv2.warpPerspective(img_rgb, matriz_transformacion, (ancho_max, alto_max))
+    
+    return img_transformada
+
+def procesar_imagen_individual(ruta_entrada, ruta_salida):
+    """
+    Procesa una sola imagen y la guarda.
+    
+    Args:
+        ruta_entrada (str): Ruta de la imagen original
+        ruta_salida (str): Ruta donde guardar el resultado
+    
+    Returns:
+        bool: True si se procesó correctamente, False en caso contrario
+    """
+    resultado = procesar_resistencia(ruta_entrada)
+    
+    if resultado is not None:
+        img_guardar = cv2.cvtColor(resultado, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(ruta_salida, img_guardar)
+        print(f"Procesado: {os.path.basename(ruta_entrada)} -> {os.path.basename(ruta_salida)}")
+        return True
+    else:
+        print(f"Error procesando: {os.path.basename(ruta_entrada)}")
+        return False
+
+def procesar_todas_las_resistencias(carpeta_entrada="Resistencias", carpeta_salida="Resistencias_output"):
+    """
+    Procesa todas las imágenes de resistencias en la carpeta especificada.
+    
+    Args:
+        carpeta_entrada (str): Carpeta con las imágenes originales
+        carpeta_salida (str): Carpeta donde guardar los resultados
+    """
+    if not os.path.exists(carpeta_salida):
+        os.makedirs(carpeta_salida)
+    
+    patrones = [
+        os.path.join(carpeta_entrada, "R*_*.jpg"),
+        os.path.join(carpeta_entrada, "R*_*.png"),
+        os.path.join(carpeta_entrada, "R*_*.jpeg")
+    ]
+    
+    archivos_encontrados = []
+    for patron in patrones:
+        archivos_encontrados.extend(glob.glob(patron))
+    
+    if not archivos_encontrados:
+        print(f"No se encontraron imágenes en la carpeta '{carpeta_entrada}'")
+        print("Formatos buscados: R*_*.jpg, R*_*.png, R*_*.jpeg")
+        return
+    
+    print(f"Encontradas {len(archivos_encontrados)} imágenes para procesar")
+    print(f"Carpeta de entrada: {carpeta_entrada}")
+    print(f"Carpeta de salida: {carpeta_salida}")
+    print("-" * 50)
+    
+    procesadas_exitosamente = 0
+    
+    for ruta_entrada in sorted(archivos_encontrados):
+        nombre_archivo = os.path.basename(ruta_entrada)
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        nombre_salida = f"{nombre_sin_ext}_out.jpg"
+        ruta_salida = os.path.join(carpeta_salida, nombre_salida)
+        
+        if procesar_imagen_individual(ruta_entrada, ruta_salida):
+            procesadas_exitosamente += 1
+    
+    print("-" * 50)
+    print(f"Proceso completado: {procesadas_exitosamente}/{len(archivos_encontrados)} imágenes procesadas exitosamente")
+
+if __name__ == "__main__":
+    procesar_todas_las_resistencias()

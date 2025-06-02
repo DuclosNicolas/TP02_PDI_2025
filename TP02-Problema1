@@ -1,0 +1,538 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter
+
+class PCBComponentDetector:
+    def __init__(self, image_path):
+        """
+        Inicializa el detector con la imagen de la placa PCB
+
+        Args:
+            image_path (str): Ruta a la imagen de la placa PCB
+        """
+        self.original_image = cv2.imread(image_path)
+        if self.original_image is None:
+            raise ValueError(f"No se pudo cargar la imagen: {image_path}")
+
+        # Variables para almacenar imágenes procesadas
+        self.gray_image = None
+        self.binary_image = None
+        self.edges = None
+        self.closed_edges = None
+
+        # Variables para almacenar componentes detectados
+        self.all_components = []
+        self.component_features = []
+        self.resistors = []
+        self.capacitors = []
+        self.chips = []
+
+    # ==================== PROCESAMIENTO DE IMÁGENES ====================
+
+    def _convert_to_grayscale(self):
+        """Convierte la imagen original a escala de grises"""
+        self.gray_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+        return self.gray_image
+
+    def _apply_threshold(self):
+        """
+        Aplica umbralización adaptativa para binarizar la imagen
+        Utiliza método Gaussiano con ventana de 15x15 y constante C=4
+        """
+        if self.gray_image is None:
+            self._convert_to_grayscale()
+
+        self.binary_image = cv2.adaptiveThreshold(
+            self.gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 4
+        )
+        return self.binary_image
+
+    def _apply_canny(self, low_threshold=40, high_threshold=90):
+        """
+        Aplica detector de bordes Canny con suavizado previo
+
+        Args:
+            low_threshold (int): Umbral inferior para Canny
+            high_threshold (int): Umbral superior para Canny
+        """
+        if self.gray_image is None:
+            self._convert_to_grayscale()
+
+        # Aplicar filtro Gaussiano para reducir ruido
+        blurred = cv2.GaussianBlur(self.gray_image, (5, 5), 0)
+
+        # Operación morfológica de apertura para limpiar la imagen
+        morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        cleaned = cv2.morphologyEx(blurred, cv2.MORPH_OPEN, morph_kernel)
+
+        # Aplicar detector de bordes Canny
+        self.edges = cv2.Canny(cleaned, low_threshold, high_threshold)
+        return self.edges
+
+    def _close_edges(self, kernel_size=(15, 10)):
+        """
+        Aplica operación morfológica de cierre para conectar bordes fragmentados
+
+        Args:
+            kernel_size (tuple): Tamaño del kernel morfológico
+        """
+        if self.edges is None:
+            self._apply_canny()
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, kernel_size)
+        self.closed_edges = cv2.morphologyEx(self.edges, cv2.MORPH_CLOSE, kernel)
+        return self.closed_edges
+
+    def _find_components(self, min_area=3000):
+        """
+        Encuentra todos los componentes en la imagen y calcula sus características
+
+        Args:
+            min_area (int): Área mínima para considerar un componente válido
+        """
+        if self.closed_edges is None:
+            self._close_edges()
+
+        # Encontrar contornos externos
+        contours, _ = cv2.findContours(self.closed_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Filtrar contornos por área mínima
+        self.all_components = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
+
+        # Calcular características geométricas para cada componente
+        self.component_features = []
+        for contour in self.all_components:
+            features = self._calculate_features(contour)
+            self.component_features.append(features)
+
+        return self.component_features
+
+    def _calculate_features(self, contour):
+        """
+        Calcula características geométricas de un componente
+
+        Args:
+            contour: Contorno del componente
+
+        Returns:
+            dict: Diccionario con todas las características calculadas
+        """
+        # Calcular bounding box y área
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+
+        # Calcular relación de aspecto y factor de llenado
+        aspect_ratio = float(w) / h if h > 0 else 0
+        extent = float(area) / (w * h) if (w * h) > 0 else 0
+
+        # Calcular centro de masa usando momentos
+        moments = cv2.moments(contour)
+        if moments['m00'] != 0:
+            cx = int(moments['m10'] / moments['m00'])
+            cy = int(moments['m01'] / moments['m00'])
+        else:
+            cx, cy = x + w//2, y + h//2
+
+        # Calcular perímetro y circularidad
+        perimeter = cv2.arcLength(contour, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+
+        # Calcular solidez usando casco convexo
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = float(area) / hull_area if hull_area > 0 else 0
+
+        # Calcular rectangularidad
+        rect_area = w * h
+        rectangularity = float(area) / rect_area if rect_area > 0 else 0
+
+        return {
+            'contour': contour,
+            'bbox': (x, y, w, h),
+            'area': area,
+            'aspect_ratio': aspect_ratio,
+            'extent': extent,
+            'center': (cx, cy),
+            'perimeter': perimeter,
+            'circularity': circularity,
+            'solidity': solidity,
+            'rectangularity': rectangularity
+        }
+
+    # ==================== DETECCIÓN ESPECÍFICA DE COMPONENTES ====================
+
+    def _detect_resistors(self, area_range=(2000, 150000), aspect_ratio_target=4.5, tolerance=1.5):
+        """
+        Detecta resistencias basándose en área y relación de aspecto característica
+
+        Args:
+            area_range (tuple): Rango de área válido para resistencias
+            aspect_ratio_target (float): Relación de aspecto objetivo para resistencias
+            tolerance (float): Tolerancia permitida en la relación de aspecto
+        """
+        if not self.component_features:
+            self._find_components()
+
+        resistors = []
+        for feat in self.component_features:
+            area = feat['area']
+            aspect_ratio = feat['aspect_ratio']
+
+            # Verificar que el área esté en el rango válido
+            if area_range[0] <= area <= area_range[1]:
+                # Verificar relación de aspecto en ambas orientaciones
+                if (abs(aspect_ratio - aspect_ratio_target) < tolerance or
+                    abs(1/aspect_ratio - aspect_ratio_target) < tolerance):
+                    resistors.append(feat)
+
+        self.resistors = resistors
+        return resistors
+
+    def _detect_capacitors(self, area_range=(3000, 2000000), aspect_ratio_range=(0.8, 2.0),
+                          circularity_min=0.2, solidity_min=0.01):
+        """
+        Detecta capacitores basándose en forma más circular y características geométricas
+
+        Args:
+            area_range (tuple): Rango de área válido para capacitores
+            aspect_ratio_range (tuple): Rango de relación de aspecto válido
+            circularity_min (float): Circularidad mínima requerida
+            solidity_min (float): Solidez mínima requerida
+        """
+        if not self.component_features:
+            self._find_components()
+
+        capacitors = []
+        for feat in self.component_features:
+            area = feat['area']
+            aspect_ratio = feat['aspect_ratio']
+            circularity = feat['circularity']
+            solidity = feat['solidity']
+
+            # Aplicar todos los criterios de filtrado
+            if (area_range[0] <= area <= area_range[1] and
+                aspect_ratio_range[0] <= aspect_ratio <= aspect_ratio_range[1] and
+                circularity >= circularity_min and
+                solidity >= solidity_min):
+                capacitors.append(feat)
+
+        self.capacitors = capacitors
+        return capacitors
+
+    def _detect_chips(self, area_range=(15000, 500000), aspect_ratio_range=(0.3, 3.0),
+                     rectangularity_min=0.6, solidity_min=0.7):
+        """
+        Detecta chips IC basándose en forma rectangular y eliminando capacitores previamente detectados
+
+        Args:
+            area_range (tuple): Rango de área válido para chips
+            aspect_ratio_range (tuple): Rango de relación de aspecto válido
+            rectangularity_min (float): Rectangularidad mínima requerida
+            solidity_min (float): Solidez mínima requerida
+        """
+        if not self.component_features:
+            self._find_components()
+
+        # Detectar capacitores para eliminarlos del análisis de chips
+        capacitors = self._detect_capacitors()
+
+        # Crear máscara para excluir regiones de capacitores
+        mask = self._create_mask_from_components(capacitors)
+
+        # Aplicar máscara a la imagen de bordes cerrados
+        masked_edges = cv2.bitwise_and(self.closed_edges, mask)
+
+        # Encontrar contornos en la imagen enmascarada
+        contours, _ = cv2.findContours(masked_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > area_range[0]]
+
+        # Analizar cada contorno para determinar si es un chip
+        chips = []
+        for contour in filtered_contours:
+            features = self._calculate_features(contour)
+
+            area = features['area']
+            aspect_ratio = features['aspect_ratio']
+            rectangularity = features['rectangularity']
+            solidity = features['solidity']
+
+            # Considerar relación de aspecto en ambas orientaciones
+            aspect_ratio_inv = 1.0 / aspect_ratio if aspect_ratio > 0 else 0
+
+            # Verificar todos los criterios para chips
+            if (area_range[0] <= area <= area_range[1] and
+                (aspect_ratio_range[0] <= aspect_ratio <= aspect_ratio_range[1] or
+                 aspect_ratio_range[0] <= aspect_ratio_inv <= aspect_ratio_range[1]) and
+                rectangularity >= rectangularity_min and
+                solidity >= solidity_min):
+
+                # Determinar orientación del chip
+                features['orientation'] = "horizontal" if aspect_ratio > 1 else "vertical"
+                chips.append(features)
+
+        self.chips = chips
+        return chips
+
+    def _create_mask_from_components(self, components_list):
+        """
+        Crea una máscara binaria para excluir componentes específicos del análisis
+
+        Args:
+            components_list (list): Lista de componentes a excluir
+
+        Returns:
+            numpy.ndarray: Máscara binaria
+        """
+        mask = np.ones(self.gray_image.shape, dtype=np.uint8) * 255
+
+        for component in components_list:
+            x, y, w, h = component['bbox']
+            # Agregar margen para asegurar exclusión completa
+            margin = 10
+            x_start = max(0, x - margin)
+            y_start = max(0, y - margin)
+            x_end = min(mask.shape[1], x + w + margin)
+            y_end = min(mask.shape[0], y + h + margin)
+
+            # Marcar región como excluida (valor 0)
+            mask[y_start:y_end, x_start:x_end] = 0
+
+        return mask
+
+    # ==================== FUNCIONES PRINCIPALES SEGÚN ENUNCIADOS ====================
+
+    def a_procesar_imagen(self):
+        """
+        Problema a) Procesar la imagen
+
+        Aplica técnicas de procesamiento para segmentar y distinguir tres tipos
+        principales de componentes: resistencias, capacitores y chips.
+        Genera una imagen de salida mostrando la segmentación de los tres tipos.
+
+        Returns:
+            numpy.ndarray: Imagen con la segmentación de componentes
+        """
+        print("=" * 60)
+        print("PROBLEMA A) PROCESAMIENTO Y SEGMENTACION DE IMAGEN")
+        print("=" * 60)
+
+        # Ejecutar secuencia completa de procesamiento
+        self._convert_to_grayscale()
+        self._apply_threshold()
+        self._apply_canny()
+        self._close_edges()
+        self._find_components()
+
+        # Detectar los tres tipos de componentes especificados
+        resistors = self._detect_resistors()
+        capacitors = self._detect_capacitors()
+        chips = self._detect_chips()
+
+        # Crear imagen de salida con segmentación visual
+        output_image = self.original_image.copy()
+
+        # Dibujar resistencias con color rojo y etiqueta
+        for feat in resistors:
+            x, y, w, h = feat['bbox']
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.putText(output_image, "RESISTOR", (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # Dibujar capacitores con color azul y etiqueta
+        for feat in capacitors:
+            x, y, w, h = feat['bbox']
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), (255, 0, 0), 3)
+            cv2.putText(output_image, "CAPACITOR", (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+        # Dibujar chips con color verde y etiqueta
+        for feat in chips:
+            x, y, w, h = feat['bbox']
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 255, 0), 3)
+            cv2.putText(output_image, "CHIP", (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Mostrar imagen de salida con segmentación
+        plt.figure(figsize=(15, 10))
+        plt.imshow(cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB))
+        title = f"SEGMENTACION DE COMPONENTES\nResistores: {len(resistors)} | Capacitores: {len(capacitors)} | Chips: {len(chips)}"
+        plt.title(title, fontsize=16, fontweight='bold')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+        # Mostrar resultados en consola
+        print(f"Procesamiento completado")
+        print(f"Resistencias detectadas: {len(resistors)}")
+        print(f"Capacitores detectados: {len(capacitors)}")
+        print(f"Chips detectados: {len(chips)}")
+        print(f"Imagen de segmentacion generada")
+
+        return output_image
+
+    def b_clasificar_capacitores(self):
+        """
+        Problema b) Clasificar capacitores electrolíticos
+
+        Clasifica los capacitores según su tamaño físico en categorías predefinidas.
+        Cuenta la cantidad de capacitores en cada categoría.
+        Genera una nueva imagen de salida con esta clasificación.
+
+        Returns:
+            tuple: (imagen_clasificada, diccionario_conteos)
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEMA B) CLASIFICACION DE CAPACITORES POR TAMAÑO")
+        print("=" * 60)
+
+        # Verificar que existen capacitores detectados
+        if not self.capacitors:
+            self._detect_capacitors()
+
+        if not self.capacitors:
+            print("No se encontraron capacitores para clasificar")
+            return None, None
+
+        def classify_capacitor_size(area):
+            """
+            Clasifica un capacitor según su área en píxeles
+
+            Args:
+                area (float): Área del capacitor en píxeles
+
+            Returns:
+                tuple: (categoría, color_BGR)
+            """
+            if area < 25000:
+                return "PEQUEÑO", (255, 255, 0)    # Cyan
+            elif area < 80000:
+                return "MEDIANO", (0, 255, 255)    # Amarillo
+            else:
+                return "GRANDE", (255, 0, 255)     # Magenta
+
+        # Clasificar cada capacitor detectado
+        classified_capacitors = []
+        size_counts = {"PEQUEÑO": 0, "MEDIANO": 0, "GRANDE": 0}
+
+        for cap in self.capacitors:
+            size_category, color = classify_capacitor_size(cap['area'])
+            cap['size_category'] = size_category
+            cap['color'] = color
+            classified_capacitors.append(cap)
+            size_counts[size_category] += 1
+
+        # Crear imagen de salida con clasificación por colores
+        output_image = self.original_image.copy()
+
+        for cap in classified_capacitors:
+            x, y, w, h = cap['bbox']
+            color = cap['color']
+            size_cat = cap['size_category']
+
+            # Dibujar rectángulo con color según categoría de tamaño
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(output_image, f"CAP-{size_cat}", (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # Mostrar imagen con clasificación
+        plt.figure(figsize=(15, 10))
+        plt.imshow(cv2.cvtColor(output_image, cv2.COLOR_BGR2RGB))
+
+        # Crear título con conteos por categoría
+        title = "CLASIFICACION DE CAPACITORES POR TAMAÑO\n"
+        title += f"Pequeños: {size_counts['PEQUEÑO']} | Medianos: {size_counts['MEDIANO']} | Grandes: {size_counts['GRANDE']}"
+
+        plt.title(title, fontsize=16, fontweight='bold')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+        # Mostrar resultados detallados en consola
+        print("Capacitores clasificados por tamaño:")
+        print(f"  Capacitores PEQUEÑOS (area < 10,000): {size_counts['PEQUEÑO']}")
+        print(f"  Capacitores MEDIANOS (10,000 <= area < 50,000): {size_counts['MEDIANO']}")
+        print(f"  Capacitores GRANDES (area >= 50,000): {size_counts['GRANDE']}")
+        print(f"Total de capacitores: {len(self.capacitors)}")
+        print("Imagen de clasificacion generada")
+
+        return output_image, size_counts
+
+    def c_contar_resistencias(self):
+        """
+        Problema c) Contar resistencias eléctricas
+
+        Determina la cantidad exacta de resistencias eléctricas presentes en la placa.
+        Muestra el resultado calculado por consola.
+
+        Returns:
+            int: Número de resistencias detectadas
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEMA C) CONTEO DE RESISTENCIAS ELECTRICAS")
+        print("=" * 60)
+
+        # Verificar que existen resistencias detectadas
+        if not self.resistors:
+            self._detect_resistors()
+
+        # Obtener cantidad exacta de resistencias
+        num_resistors = len(self.resistors)
+
+        # Mostrar resultado principal por consola
+        print("Analisis de resistencias completado")
+        print(f"CANTIDAD EXACTA DE RESISTENCIAS: {num_resistors}")
+
+        # Mostrar información adicional si existen resistencias
+        if num_resistors > 0:
+            print("Caracteristicas promedio de las resistencias:")
+            areas = [r['area'] for r in self.resistors]
+            aspects = [r['aspect_ratio'] for r in self.resistors]
+            print(f"  Area promedio: {np.mean(areas):.0f} pixeles cuadrados")
+            print(f"  Relacion de aspecto promedio: {np.mean(aspects):.2f}")
+        else:
+            print("No se detectaron resistencias en la imagen")
+
+        return num_resistors
+
+    def ejecutar_analisis_completo(self):
+        """
+        Ejecuta el análisis completo de la placa PCB según los tres problemas planteados
+        Ejecuta secuencialmente todos los problemas en el orden especificado
+        """
+        print("INICIANDO ANALISIS COMPLETO DE PCB")
+        print("=" * 80)
+
+        # Ejecutar problema a) - Procesamiento y segmentación
+        segmentation_image = self.a_procesar_imagen()
+
+        # Ejecutar problema b) - Clasificación de capacitores
+        classification_result = self.b_clasificar_capacitores()
+
+        # Ejecutar problema c) - Conteo de resistencias
+        resistor_count = self.c_contar_resistencias()
+
+        # Mostrar resumen final del análisis
+        print("\n" + "=" * 80)
+        print("RESUMEN FINAL DEL ANALISIS")
+        print("=" * 80)
+        print("Problema A: Segmentacion completada")
+        print("Problema B: Capacitores clasificados")
+        print(f"Problema C: Resistencias contadas = {resistor_count}")
+        print("=" * 80)
+        print("ANALISIS COMPLETO FINALIZADO")
+
+
+# ==================== PROGRAMA PRINCIPAL ====================
+if __name__ == "__main__":
+    """
+    Programa principal que ejecuta el análisis completo de la placa PCB
+    según los enunciados de los tres problemas planteados
+    """
+
+    # Crear instancia del detector con la imagen especificada
+    detector = PCBComponentDetector("placa.png")
+
+    # Ejecutar análisis completo
+    detector.ejecutar_analisis_completo()
