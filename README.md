@@ -1,15 +1,5 @@
 TP02 - Procesamiento de Imágenes
 Estructura Requerida
-Para ejecutar correctamente los scripts, organizar los archivos de la siguiente manera:
-proyecto/
-├── TP02-Problema1.py
-├── TP02-Problema2.py
-├── placa.png                  # REQUERIDO para Problema 1
-├── Resistencias/              # REQUERIDO para Problema 2
-│   ├── R1_001.jpg
-│   ├── R2_002.png
-│   └── ...
-└── README.md
 
 Ejecución
 Problema 1 - Análisis PCB
