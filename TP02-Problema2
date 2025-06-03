@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import os
+import matplotlib.pyplot as plt
 import glob
+
 
 def procesar_resistencia(imagen_path):
     """
@@ -162,3 +164,622 @@ def procesar_todas_las_resistencias(carpeta_entrada="Resistencias", carpeta_sali
 
 if __name__ == "__main__":
     procesar_todas_las_resistencias()
+
+class AnalizadorResistencias:
+    """
+    Analizador de resistencias mediante visión por computadora.
+    Detecta bandas de colores y calcula el valor de resistencia.
+    
+    Algoritmo principal:
+    1. Eliminación de fondo azul mediante segmentación HSV
+    2. Detección de bordes con filtro Sobel para localizar bandas
+    3. Análisis de picos de intensidad para determinar posiciones
+    4. Clasificación de colores mediante rangos HSV calibrados
+    5. Separación de bandas de valor y tolerancia por análisis de distancias
+    """
+    
+    def __init__(self, ratio_distancia_tolerancia=0.15, umbral_intensidad=300):
+        """
+        Inicializa el analizador con parámetros de detección calibrados.
+        
+        Args:
+            ratio_distancia_tolerancia: Threshold relativo para detectar separación 
+                                      entre banda de tolerancia y bandas de valor
+            umbral_intensidad: Threshold absoluto para detección de picos en 
+                             gradiente horizontal (filtro Sobel)
+        """
+        self.definiciones_colores = self._definir_colores()
+        self.valores_colores = self._definir_valores_colores()
+        self.ratio_distancia_tolerancia = ratio_distancia_tolerancia
+        self.umbral_intensidad = umbral_intensidad
+    
+    def _definir_colores(self):
+        """
+        Define rangos HSV calibrados para cada color estándar de resistencias.
+        
+        HSV permite mejor separación de colores que RGB bajo diferentes 
+        condiciones de iluminación. Algunos colores requieren múltiples 
+        rangos debido a discontinuidades en el espacio HSV (ej: rojo).
+        """
+        return {
+            'Negro': {
+                # Baja saturación y valor para detectar tonos oscuros
+                'hsv_range': [(np.array([0, 0, 0]), np.array([180, 40, 30]))],
+                'name': 'Negro'
+            },
+            'Marrón': {
+                # Rango estrecho en H para capturar tonos marrones/cafés
+                'hsv_range': [(np.array([5, 50, 20]), np.array([15, 200, 100]))],
+                'name': 'Marrón'
+            },
+            'Rojo': {
+                # Dos rangos necesarios: rojo bajo (0-5°) y rojo alto (175-180°)
+                # debido a la discontinuidad del matiz en 0°/360°
+                'hsv_range': [
+                    (np.array([0, 150, 100]), np.array([5, 255, 255])),
+                    (np.array([175, 150, 100]), np.array([180, 255, 255]))
+                ],
+                'name': 'Rojo'
+            },
+            'Naranja': {
+                # Zona intermedia entre rojo y amarillo
+                'hsv_range': [(np.array([10, 120, 120]), np.array([20, 255, 255]))],
+                'name': 'Naranja'
+            },
+            'Amarillo': {
+                # Rango amplio para capturar variaciones de amarillo
+                'hsv_range': [(np.array([20, 60, 60]), np.array([40, 255, 255]))],
+                'name': 'Amarillo'
+            },
+            'Verde': {
+                # Zona central del espectro verde
+                'hsv_range': [(np.array([36, 100, 80]), np.array([75, 255, 255]))],
+                'name': 'Verde'
+            },
+            'Azul': {
+                # Rango azul medio, evitando solapamiento con cian y violeta
+                'hsv_range': [(np.array([90, 100, 80]), np.array([120, 255, 255]))],
+                'name': 'Azul'
+            },
+            'Violeta': {
+                # Zona púrpura-violeta del espectro
+                'hsv_range': [(np.array([125, 100, 80]), np.array([155, 255, 255]))],
+                'name': 'Violeta'
+            },
+            'Gris': {
+                # Baja saturación, rango medio de valor para grises
+                'hsv_range': [(np.array([0, 0, 50]), np.array([180, 30, 160]))],
+                'name': 'Gris'
+            },
+            'Blanco': {
+                # Alta luminosidad, muy baja saturación
+                'hsv_range': [(np.array([0, 0, 200]), np.array([180, 20, 255]))],
+                'name': 'Blanco'
+            },
+            'Plata': {
+                # Tono metálico: baja saturación, luminosidad media-alta
+                'hsv_range': [(np.array([0, 0, 120]), np.array([180, 15, 200]))],
+                'name': 'Plata'
+            }
+        }
+    
+    def _definir_valores_colores(self):
+        """
+        Mapeo según estándar IEC 60062 para códigos de colores en resistencias.
+        
+        - valor: dígito representado (0-9)
+        - multiplicador: potencia de 10 para tercera banda
+        - tolerancia: porcentaje de precisión (solo bandas específicas)
+        """
+        return {
+            'Negro': {'valor': 0, 'multiplicador': 1, 'tolerancia': None},
+            'Marrón': {'valor': 1, 'multiplicador': 10, 'tolerancia': 1},
+            'Rojo': {'valor': 2, 'multiplicador': 100, 'tolerancia': 2},
+            'Naranja': {'valor': 3, 'multiplicador': 1000, 'tolerancia': None},
+            'Amarillo': {'valor': 4, 'multiplicador': 10000, 'tolerancia': None},
+            'Verde': {'valor': 5, 'multiplicador': 100000, 'tolerancia': 0.5},
+            'Azul': {'valor': 6, 'multiplicador': 1000000, 'tolerancia': 0.25},
+            'Violeta': {'valor': 7, 'multiplicador': 10000000, 'tolerancia': 0.1},
+            'Gris': {'valor': 8, 'multiplicador': 100000000, 'tolerancia': 0.05},
+            'Blanco': {'valor': 9, 'multiplicador': 1000000000, 'tolerancia': None},
+            # Colores especiales solo para multiplicador/tolerancia
+            'Dorado': {'valor': None, 'multiplicador': 0.1, 'tolerancia': 5},
+            'Plata': {'valor': None, 'multiplicador': 0.01, 'tolerancia': 10}
+        }
+    
+    def calcular_valor_resistencia(self, colores_valor, colores_tolerancia=None):
+        """
+        Implementa fórmula estándar: (D1*10 + D2) * M
+        donde D1, D2 son primeros dígitos y M es multiplicador.
+        
+        Args:
+            colores_valor: Bandas de valor en orden [1er dígito, 2do dígito, multiplicador]
+            colores_tolerancia: Banda de tolerancia (opcional)
+            
+        Returns:
+            dict: Resultado del cálculo con manejo de errores
+        """
+        if len(colores_valor) < 3:
+            return {
+                'valor_ohms': None,
+                'valor_formateado': 'Insuficientes bandas',
+                'tolerancia': None,
+                'error': 'Se necesitan al menos 3 bandas de valor'
+            }
+        
+        try:
+            primer_digito = self.valores_colores[colores_valor[0]]['valor']
+            segundo_digito = self.valores_colores[colores_valor[1]]['valor']
+            multiplicador = self.valores_colores[colores_valor[2]]['multiplicador']
+            
+            if primer_digito is None or segundo_digito is None:
+                raise ValueError("Colores de dígitos inválidos")
+            
+            # Fórmula estándar de resistencias
+            valor_base = (primer_digito * 10 + segundo_digito) * multiplicador
+            
+            # Extracción de tolerancia si existe
+            tolerancia = None
+            if colores_tolerancia and len(colores_tolerancia) > 0:
+                color_tolerancia = colores_tolerancia[0]
+                if color_tolerancia in self.valores_colores:
+                    tolerancia = self.valores_colores[color_tolerancia]['tolerancia']
+            
+            valor_formateado = self._formatear_valor(valor_base)
+            
+            return {
+                'valor_ohms': valor_base,
+                'valor_formateado': valor_formateado,
+                'tolerancia': tolerancia,
+                'error': None
+            }
+            
+        except (KeyError, ValueError) as e:
+            return {
+                'valor_ohms': None,
+                'valor_formateado': 'Error en cálculo',
+                'tolerancia': None,
+                'error': str(e)
+            }
+    
+    def _formatear_valor(self, valor_ohms):
+        """Formateo con unidades ingenieriles estándar (Ω, kΩ, MΩ)."""
+        if valor_ohms >= 1_000_000:
+            return f"{valor_ohms / 1_000_000:.1f}MΩ"
+        elif valor_ohms >= 1_000:
+            return f"{valor_ohms / 1_000:.1f}kΩ"
+        else:
+            return f"{valor_ohms:.1f}Ω"
+    
+    def _eliminar_fondo(self, img_rgb):
+        """
+        Segmentación de fondo azul mediante umbralización HSV.
+        
+        Proceso:
+        1. Conversión RGB->HSV para mejor separación cromática
+        2. Máscara binaria para fondo azul específico
+        3. Operaciones morfológicas para limpieza de ruido
+        4. Extracción del contorno principal (resistencia)
+        
+        Returns:
+            tuple: (imagen limpia, máscara de resistencia)
+        """
+        img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+        
+        # Rango HSV calibrado para fondo azul específico del dataset
+        mascara_azul = cv2.inRange(img_hsv, np.array([100, 50, 50]), np.array([125, 255, 255]))
+        mascara_resistencia = cv2.bitwise_not(mascara_azul)
+        
+        # Morfología: cerrado para conectar componentes, apertura para eliminar ruido
+        kernel = np.ones((31, 3), np.uint8)  # Kernel rectangular para estructuras horizontales
+        mascara_resistencia = cv2.morphologyEx(mascara_resistencia, cv2.MORPH_CLOSE, kernel)
+        mascara_resistencia = cv2.morphologyEx(mascara_resistencia, cv2.MORPH_OPEN, kernel)
+        
+        # Extracción del componente conexo más grande (resistencia principal)
+        contornos, _ = cv2.findContours(mascara_resistencia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contornos:
+            contorno_principal = max(contornos, key=cv2.contourArea)
+            mascara_limpia = np.zeros_like(mascara_resistencia)
+            cv2.fillPoly(mascara_limpia, [contorno_principal], 255)
+            
+            # Reemplazo de fondo con blanco para análisis posterior
+            img_limpia = img_rgb.copy()
+            img_limpia[mascara_limpia == 0] = [255, 255, 255]
+            
+            return img_limpia, mascara_limpia
+        
+        return img_rgb, np.ones(img_rgb.shape[:2], dtype=np.uint8) * 255
+    
+    def _obtener_region_bandas(self, mascara, margen_h=0.14, margen_v=0.15):
+        """
+        Calcula región de interés excluyendo terminales metálicas.
+        
+        Los márgenes eliminan las zonas donde no pueden existir bandas:
+        - margen_h: excluye extremos horizontales (terminales)
+        - margen_v: excluye bordes verticales (imperfecciones)
+        
+        Returns:
+            dict: Coordenadas de la región central de análisis
+        """
+        coordenadas = np.column_stack(np.where(mascara > 0))
+        if len(coordenadas) == 0:
+            return None
+        
+        # Bounding box de la resistencia
+        y_min, x_min = coordenadas.min(axis=0)
+        y_max, x_max = coordenadas.max(axis=0)
+        
+        # Aplicación de márgenes proporcionales
+        ancho, alto = x_max - x_min, y_max - y_min
+        margen_x, margen_y = int(ancho * margen_h), int(alto * margen_v)
+        
+        return {
+            'x_inicio': x_min + margen_x,
+            'x_fin': x_max - margen_x,
+            'y_inicio': y_min + margen_y,
+            'y_fin': y_max - margen_y
+        }
+    
+    def _encontrar_bandas(self, img_rgb, mascara):
+        """
+        Detección de bandas mediante análisis de gradiente horizontal.
+        
+        Algoritmo:
+        1. Conversión a escala de grises
+        2. Aplicación de filtro Sobel-X para detectar bordes verticales
+        3. Proyección vertical para obtener perfil de intensidad
+        4. Suavizado con kernel de convolución
+        5. Detección de picos locales con threshold
+        6. Filtrado por distancia mínima entre picos
+        
+        Returns:
+            list: Posiciones X de las bandas detectadas
+        """
+        region = self._obtener_region_bandas(mascara)
+        if not region:
+            return []
+        
+        img_gris = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        img_gris[mascara == 0] = 255  # Fondo blanco para máximo contraste
+        
+        # Extracción de ROI
+        region_bandas = img_gris[region['y_inicio']:region['y_fin'], 
+                                region['x_inicio']:region['x_fin']]
+        
+        # Filtro Sobel horizontal: destaca transiciones verticales (bordes de bandas)
+        sobel_x = cv2.Sobel(region_bandas, cv2.CV_64F, 1, 0, ksize=1)
+        sobel_x = np.uint8(np.absolute(sobel_x))
+        
+        # Proyección vertical: suma columnas para obtener perfil 1D
+        perfil = np.sum(sobel_x, axis=0)
+        
+        # Suavizado gaussiano para reducir ruido y false positives
+        kernel = np.ones(30) / 30
+        perfil_suave = np.convolve(perfil, kernel, mode='same')
+        
+        # Detección de máximos locales con threshold adaptativo
+        candidatos = []
+        for i in range(1, len(perfil_suave) - 1):
+            if (perfil_suave[i] > perfil_suave[i-1] and 
+                perfil_suave[i] > perfil_suave[i+1] and 
+                perfil_suave[i] > self.umbral_intensidad):
+                pos_abs = region['x_inicio'] + i  # Conversión a coordenadas absolutas
+                candidatos.append((pos_abs, perfil_suave[i]))
+        
+        # Supresión no-máxima: elimina picos demasiado cercanos
+        ancho = region['x_fin'] - region['x_inicio']
+        distancia_min = ancho // 5.5  # Distancia mínima empírica entre bandas
+        picos_filtrados = []
+        
+        # Algoritmo greedy: selecciona picos de mayor intensidad primero
+        for pico in sorted(candidatos, key=lambda x: x[1], reverse=True):
+            if not any(abs(pico[0] - existente[0]) < distancia_min for existente in picos_filtrados):
+                picos_filtrados.append(pico)
+        
+        return sorted([pico[0] for pico in picos_filtrados])[:8]  # Máximo 8 bandas
+    
+    def _analizar_distancias_bandas(self, posiciones_bandas):
+        """
+        Separación de bandas de valor y tolerancia mediante análisis estadístico.
+        
+        La banda de tolerancia típicamente está separada del grupo principal
+        por una distancia mayor. Se usa análisis de gaps para detectar esta
+        separación atípica.
+        
+        Returns:
+            tuple: (posiciones_valor, posiciones_tolerancia)
+        """
+        if len(posiciones_bandas) < 3:
+            return posiciones_bandas, []
+        
+        # Cálculo de distancias inter-banda
+        distancias = []
+        for i in range(len(posiciones_bandas) - 1):
+            distancias.append(posiciones_bandas[i+1] - posiciones_bandas[i])
+        
+        if len(distancias) >= 2:
+            # Distancia media de bandas principales (excluyendo última)
+            distancia_promedio = np.mean(distancias[:-1])
+            
+            # Detección de gap significativo al final (banda de tolerancia separada)
+            if len(distancias) >= 3 and distancias[-1] > distancia_promedio * (1 + self.ratio_distancia_tolerancia):
+                posiciones_tolerancia = [posiciones_bandas[-1]]
+                posiciones_valor = posiciones_bandas[:-1]
+                return posiciones_valor, posiciones_tolerancia
+            
+            # Detección de gap al inicio (caso menos común)
+            elif distancias[0] > distancia_promedio * (1 + self.ratio_distancia_tolerancia):
+                posiciones_tolerancia = [posiciones_bandas[0]]
+                posiciones_valor = posiciones_bandas[1:]
+                return posiciones_valor, posiciones_tolerancia
+        
+        # Sin separación clara: todas son bandas de valor
+        return posiciones_bandas, []
+    
+    def _detectar_color(self, region_hsv, nombre_color, config_color):
+        """
+        Conteo de píxeles que coinciden con rangos HSV de un color específico.
+        
+        Maneja múltiples rangos HSV para colores complejos (ej: rojo).
+        Retorna la densidad de píxeles coincidentes como métrica de confianza.
+        """
+        pixeles_totales = 0
+        
+        for hsv_bajo, hsv_alto in config_color['hsv_range']:
+            mascara = cv2.inRange(region_hsv, hsv_bajo, hsv_alto)
+            pixeles_totales += cv2.countNonZero(mascara)
+        
+        return pixeles_totales
+    
+    def _identificar_colores_bandas(self, img_rgb, mascara, posiciones_bandas):
+        """
+        Clasificación de colores mediante análisis de ROI en cada banda.
+        
+        Para cada posición de banda:
+        1. Define ventana de análisis centrada en la posición
+        2. Extrae región vertical correspondiente a la resistencia
+        3. Evalúa coincidencia con cada color definido
+        4. Selecciona color con mayor densidad de píxeles coincidentes
+        
+        Returns:
+            list: Colores identificados en orden de las bandas
+        """
+        if not posiciones_bandas:
+            return []
+        
+        img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+        colores = []
+        ancho_banda = 15  # Ventana de análisis por banda (píxeles)
+        
+        for pos_x in posiciones_bandas:
+            # Definición de ventana horizontal
+            x_inicio = max(0, pos_x - ancho_banda // 2)
+            x_fin = min(img_rgb.shape[1], pos_x + ancho_banda // 2)
+            
+            # Extracción de límites verticales de la resistencia
+            coords_y = np.where(mascara[:, pos_x] > 0)[0]
+            if len(coords_y) > 0:
+                y_inicio, y_fin = coords_y[0], coords_y[-1]
+            else:
+                # Fallback: usar zona central si no hay máscara válida
+                y_inicio = img_rgb.shape[0] // 3
+                y_fin = img_rgb.shape[0] * 2 // 3
+            
+            # Extracción de ROI para análisis de color
+            region_hsv = img_hsv[y_inicio:y_fin, x_inicio:x_fin]
+            
+            # Clasificación por máxima verosimilitud
+            mejor_coincidencia = 'Desconocido'
+            max_pixeles = 0
+            
+            for nombre_color, config_color in self.definiciones_colores.items():
+                pixeles = self._detectar_color(region_hsv, nombre_color, config_color)
+                if pixeles > max_pixeles:
+                    max_pixeles = pixeles
+                    mejor_coincidencia = config_color['name']
+            
+            colores.append(mejor_coincidencia)
+        
+        return colores
+    
+    def _asignar_color_tolerancia(self, posiciones_tolerancia, todos_colores):
+        """
+        Asignación heurística de color dorado para bandas de tolerancia.
+        
+        En ausencia de detección específica, asume dorado (5% tolerancia)
+        que es el estándar más común en resistencias de precisión media.
+        """
+        if not posiciones_tolerancia:
+            return []
+        
+        colores_tolerancia = []
+        for _ in posiciones_tolerancia:
+            colores_tolerancia.append('Dorado')  # Heurística: dorado por defecto
+        
+        return colores_tolerancia
+    
+    def _visualizar_resultado(self, img_original, img_limpia, posiciones_valor, posiciones_tolerancia, 
+                            colores_valor, colores_tolerancia, nombre_archivo, info_calculo):
+        """
+        Generación de visualización diagnóstica con overlay de resultados.
+        
+        Muestra:
+        - Imagen original vs procesada
+        - Líneas de detección de bandas (rojo=valor, verde=tolerancia)
+        - Etiquetas de colores identificados
+        - Resultado del cálculo de resistencia
+        """
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Panel izquierdo: imagen original
+        ax1.imshow(img_original)
+        ax1.set_title(f'Original: {nombre_archivo}')
+        ax1.axis('off')
+        
+        # Panel derecho: resultado con annotations
+        img_resultado = img_limpia.copy()
+        
+        # Overlay de bandas de valor (líneas rojas)
+        for i, pos in enumerate(posiciones_valor):
+            cv2.line(img_resultado, (pos, 0), (pos, img_resultado.shape[0]), (0, 0, 255), 3)
+            if i < len(colores_valor):
+                etiqueta = f"V{i+1}: {colores_valor[i]}"
+                cv2.putText(img_resultado, etiqueta, (pos-40, 30+i*25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        # Overlay de bandas de tolerancia (líneas verdes)
+        for i, pos in enumerate(posiciones_tolerancia):
+            cv2.line(img_resultado, (pos, 0), (pos, img_resultado.shape[0]), (0, 255, 0), 3)
+            if i < len(colores_tolerancia):
+                etiqueta = f"T: {colores_tolerancia[i]}"
+                cv2.putText(img_resultado, etiqueta, (pos-40, 120+i*25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        ax2.imshow(img_resultado)
+        
+        # Generación de título con resultado
+        if len(colores_valor) >= 3:
+            valor_texto = f"Valor: {info_calculo['valor_formateado']}"
+            if info_calculo['tolerancia']:
+                valor_texto += f" ±{info_calculo['tolerancia']}%"
+            status = "✓"  # Éxito
+        else:
+            valor_texto = f"Solo {len(colores_valor)} bandas detectadas"
+            status = "⚠"  # Advertencia
+        
+        ax2.set_title(f'{status} {nombre_archivo}\n{valor_texto}')
+        ax2.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def analizar_resistencia_individual(self, ruta_imagen):
+        """
+        Pipeline completo de análisis para una resistencia individual.
+        
+        Flujo:
+        1. Carga y conversión de imagen
+        2. Eliminación de fondo
+        3. Detección de posiciones de bandas
+        4. Separación valor/tolerancia
+        5. Identificación de colores
+        6. Cálculo de valor
+        7. Visualización de resultados
+        
+        Returns:
+            dict: Resultado completo del análisis
+        """
+        img = cv2.imread(ruta_imagen)
+        if img is None:
+            print(f"Error: No se pudo cargar {ruta_imagen}")
+            return None
+        
+        nombre_archivo = os.path.basename(ruta_imagen)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # OpenCV usa BGR por defecto
+        
+        # Pipeline de procesamiento
+        img_limpia, mascara = self._eliminar_fondo(img_rgb)
+        todas_posiciones_bandas = self._encontrar_bandas(img_limpia, mascara)
+        
+        posiciones_valor, posiciones_tolerancia = self._analizar_distancias_bandas(todas_posiciones_bandas)
+        
+        colores_valor = self._identificar_colores_bandas(img_limpia, mascara, posiciones_valor)
+        
+        if posiciones_tolerancia:
+            colores_tolerancia = self._asignar_color_tolerancia(posiciones_tolerancia, colores_valor)
+        else:
+            colores_tolerancia = []
+        
+        info_calculo = self.calcular_valor_resistencia(colores_valor, colores_tolerancia)
+        
+        # Visualización diagnóstica
+        self._visualizar_resultado(img_rgb, img_limpia, posiciones_valor, posiciones_tolerancia, 
+                                 colores_valor, colores_tolerancia, nombre_archivo, info_calculo)
+        
+        return {
+            'nombre_archivo': nombre_archivo,
+            'bandas_totales': len(todas_posiciones_bandas),
+            'bandas_valor': len(posiciones_valor),
+            'bandas_tolerancia': len(posiciones_tolerancia),
+            'colores_valor': colores_valor[:3] if len(colores_valor) >= 3 else colores_valor,
+            'colores_tolerancia': colores_tolerancia,
+            'posiciones_valor': posiciones_valor,
+            'posiciones_tolerancia': posiciones_tolerancia,
+            'calculo': info_calculo
+        }
+    
+    def analizar_todas_resistencias(self, ruta_carpeta="Resistencias_output"):
+        """
+        Procesamiento batch con estadísticas de rendimiento.
+        
+        Procesa todas las imágenes que coinciden con el patrón Rx_a_out.jpg
+        y genera métricas de éxito del algoritmo.
+        
+        Args:
+            ruta_carpeta: Directorio con las imágenes a procesar
+            
+        Returns:
+            list: Resultados de todos los análisis realizados
+        """
+        patron = os.path.join(ruta_carpeta, "R*_a_out.jpg")
+        archivos_imagen = glob.glob(patron)
+        
+        if not archivos_imagen:
+            print(f"No se encontraron imágenes con formato Rx_a_out.jpg en {ruta_carpeta}")
+            return []
+        
+        resultados = []
+        print(f"Analizando {len(archivos_imagen)} resistencias...")
+        print(f"Umbral de intensidad: {self.umbral_intensidad}")
+        print(f"Ratio de distancia para tolerancia: {self.ratio_distancia_tolerancia}")
+        print("=" * 80)
+        
+        # Procesamiento secuencial con feedback
+        for ruta_imagen in sorted(archivos_imagen):
+            resultado = self.analizar_resistencia_individual(ruta_imagen)
+            if resultado:
+                resultados.append(resultado)
+                
+                # Reporte por imagen
+                nombre_archivo = resultado['nombre_archivo']
+                colores_valor = resultado['colores_valor']
+                info_calculo = resultado['calculo']
+                
+                status = "✓" if len(colores_valor) >= 3 else "⚠"
+                
+                if info_calculo['valor_formateado'] != 'Error en cálculo':
+                    valor_texto = info_calculo['valor_formateado']
+                    if info_calculo['tolerancia']:
+                        valor_texto += f" ±{info_calculo['tolerancia']}%"
+                else:
+                    valor_texto = "Error en cálculo"
+                
+                print(f"{status} {nombre_archivo}: {valor_texto}")
+        
+        # Estadísticas finales del batch
+        print("=" * 80)
+        print(f"Análisis completado: {len(resultados)} resistencias procesadas")
+             
+        return resultados
+
+if __name__ == "__main__":
+    print("=== PROCESAMIENTO COMPLETO DE RESISTENCIAS ===")
+    print("Paso 1: Preprocesando imágenes originales...")
+    
+    #ejecutar el preprocesamiento
+    procesar_todas_las_resistencias()
+    
+    print("\n" + "="*50)
+    print("Paso 2: Analizando resistencias procesadas...")
+    
+    #ejecutar el análisis
+    analizador = AnalizadorResistencias(
+        ratio_distancia_tolerancia=0.15,
+        umbral_intensidad=368
+    )
+    
+    resultados = analizador.analizar_todas_resistencias()
+    
+    print(f"\n=== PROCESO COMPLETO TERMINADO ===")
+    print(f"Total de resistencias analizadas: {len(resultados)}")
